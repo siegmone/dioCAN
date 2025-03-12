@@ -25,8 +25,6 @@ typedef struct esp_now_frame_s {
     uint8_t data[8];
 } esp_now_frame_t;
 
-esp_now_frame_t esp_now_frame;
-
 RingBuffer<esp_now_frame_t, 128> rb;
 
 #define SERIAL_MAX_BUFF_LEN 30
@@ -36,12 +34,16 @@ bool got_new_can_msg = false;
 bool send_can_msgs = true;
 bool send_timestamp = true;
 
+// esp_now recv callback
+
+void recv_cb(const uint8_t *mac, const uint8_t *data, int len);
+
+// SavvyCAN functions
+void send_can_over_serial(const esp_now_frame_t *ef);
 void handle_serial(void);
-unsigned short slcan_get_time(void);
-void send_can_over_serial(void);
 void send_ack(void);
 void send_nack(void);
-void recv_cb(const uint8_t *mac, const uint8_t *data, int len);
+unsigned short slcan_get_time(void);
 
 void setup() {
     Serial.begin(115200);
@@ -58,45 +60,42 @@ void loop() {
     if (!rb.empty()) {
         std::vector<esp_now_frame_t> emitted_frames = rb.emit();
         for (auto ef : emitted_frames) {
-            esp_now_frame = ef;
-            send_can_over_serial();
+            send_can_over_serial(&ef);
             handle_serial();
         }
     }
 }
 
+// esp_now recv callback
+
 void recv_cb(const uint8_t *mac, const uint8_t *data, int len) {
+    esp_now_frame_t esp_now_frame;
     memcpy(&esp_now_frame, data, sizeof(esp_now_frame));
     if (!rb.push(esp_now_frame)) {
         debugln("RingBuffer is full");
     }
 }
 
-void send_can_over_serial() {
-    char buf[45];  // Increased size for safety
+// SavvyCAN functions
+
+void send_can_over_serial(const esp_now_frame_t *ef) {
+    char buf[45];
     int idx = 0;
 
-    if (!rb.pop(esp_now_frame)) {
-        debugln("RingBuffer is empty");
-    }
-
-    if (esp_now_frame.can_id <= 0x7FF) {
+    if (ef->can_id <= 0x7FF) {
         // Standard 11-bit CAN ID
-        idx += snprintf(buf + idx, sizeof(buf) - idx, "t%03x",
-                        esp_now_frame.can_id);
-    } else if (esp_now_frame.can_id <= 0x1FFFFFFF) {
+        idx += snprintf(buf + idx, sizeof(buf) - idx, "t%03x", ef->can_id);
+    } else if (ef->can_id <= 0x1FFFFFFF) {
         // Extended 29-bit CAN ID
-        idx += snprintf(buf + idx, sizeof(buf) - idx, "T%08x",
-                        esp_now_frame.can_id);
+        idx += snprintf(buf + idx, sizeof(buf) - idx, "T%08x", ef->can_id);
     } else {
         // Invalid CAN ID
         return;
     }
 
-    idx += snprintf(buf + idx, sizeof(buf) - idx, "%d", esp_now_frame.dlc);
-    for (int i = 0; i < esp_now_frame.dlc; i++) {
-        idx += snprintf(buf + idx, sizeof(buf) - idx, "%02x",
-                        esp_now_frame.data[i]);
+    idx += snprintf(buf + idx, sizeof(buf) - idx, "%d", ef->dlc);
+    for (int i = 0; i < ef->dlc; i++) {
+        idx += snprintf(buf + idx, sizeof(buf) - idx, "%02x", ef->data[i]);
     }
 
     if (send_timestamp) {
@@ -106,6 +105,7 @@ void send_can_over_serial() {
     buf[idx++] = '\r';  // Carriage return
     buf[idx++] = '\0';  // Null-terminate the buffer
 
+    // Send it through the serial
     Serial.print(buf);
 }
 
@@ -162,7 +162,6 @@ void handle_serial() {
         case 'A':
         case 'x':
         case 'U':
-            // Serial.begin
             break;
 
         case 't':
