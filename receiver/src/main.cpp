@@ -14,6 +14,8 @@
 #include <WiFi.h>
 #include <esp_now.h>
 
+#include "ringbuffer.h"
+
 #define MESH_ID 18460
 
 typedef struct esp_now_frame_s {
@@ -25,6 +27,8 @@ typedef struct esp_now_frame_s {
 
 esp_now_frame_t esp_now_frame;
 
+RingBuffer<esp_now_frame_t, 128> rb;
+
 #define SERIAL_MAX_BUFF_LEN 30
 char slcan_com[SERIAL_MAX_BUFF_LEN];
 bool send_ok = true;
@@ -32,17 +36,17 @@ bool got_new_can_msg = false;
 bool send_can_msgs = true;
 bool send_timestamp = true;
 
-void handleSerial();
-void send_can_over_serial();
-void send_ack();
-void send_nack();
+void handle_serial(void);
+unsigned short slcan_get_time(void);
+void send_can_over_serial(void);
+void send_ack(void);
+void send_nack(void);
 void recv_cb(const uint8_t *mac, const uint8_t *data, int len);
 
 void setup() {
     Serial.begin(115200);
 
     WiFi.mode(WIFI_STA);
-    delay(10);
     while (esp_now_init() != ESP_OK) {
         debugln("Error initializing ESP-NOW");
         return;
@@ -51,50 +55,99 @@ void setup() {
 }
 
 void loop() {
-    // debugln(WiFi.macAddress());
-    send_can_over_serial();
-    handleSerial();
-    delay(100);
+    if (!rb.empty()) {
+        std::vector<esp_now_frame_t> emitted_frames = rb.emit();
+        for (auto ef : emitted_frames) {
+            esp_now_frame = ef;
+            send_can_over_serial();
+            handle_serial();
+        }
+    }
 }
 
 void recv_cb(const uint8_t *mac, const uint8_t *data, int len) {
-    if (got_new_can_msg)
-        return;
     memcpy(&esp_now_frame, data, sizeof(esp_now_frame));
-    got_new_can_msg = true;  // TODO: queue the msgs
+    if (!rb.push(esp_now_frame)) {
+        debugln("RingBuffer is full");
+    }
 }
 
 void send_can_over_serial() {
     char buf[45];  // Increased size for safety
     int idx = 0;
 
-    /*
-        if (esp_frame.can_id <= 0x7FF) {
-          // Standard 11-bit CAN ID
-          idx += snprintf(buf + idx, sizeof(buf) - idx, "t%03x",
-       esp_frame.can_id); } else if (esp_frame.can_id <= 0x1FFFFFFF) {
-          // Extended 29-bit CAN ID
-          idx += snprintf(buf + idx, sizeof(buf) - idx, "T%08x",
-       esp_frame.can_id); } else {
-          // Invalid CAN ID
-          return;
-        }
-    */
+    if (!rb.pop(esp_now_frame)) {
+        debugln("RingBuffer is empty");
+    }
 
-    idx +=
-        snprintf(buf + idx, sizeof(buf) - idx, "t%03x", esp_now_frame.can_id);
+    if (esp_now_frame.can_id <= 0x7FF) {
+        // Standard 11-bit CAN ID
+        idx += snprintf(buf + idx, sizeof(buf) - idx, "t%03x",
+                        esp_now_frame.can_id);
+    } else if (esp_now_frame.can_id <= 0x1FFFFFFF) {
+        // Extended 29-bit CAN ID
+        idx += snprintf(buf + idx, sizeof(buf) - idx, "T%08x",
+                        esp_now_frame.can_id);
+    } else {
+        // Invalid CAN ID
+        return;
+    }
+
     idx += snprintf(buf + idx, sizeof(buf) - idx, "%d", esp_now_frame.dlc);
     for (int i = 0; i < esp_now_frame.dlc; i++) {
         idx += snprintf(buf + idx, sizeof(buf) - idx, "%02x",
                         esp_now_frame.data[i]);
     }
 
+    if (send_timestamp) {
+        idx += snprintf(buf + idx, sizeof(buf) - idx, "%02x", slcan_get_time());
+    }
+
     buf[idx++] = '\r';  // Carriage return
     buf[idx++] = '\0';  // Null-terminate the buffer
+
     Serial.print(buf);
 }
 
-void handleSerial() {
+void handle_serial() {
+    // clang-format off
+    /* ============================ SLCAN/LAWICEL Commands ====================================
+
+            ACK = Acknoledged but not implemented ( OK returned)
+            Yes = implemented
+                -  = Not implemented
+
+
+        CMD | IMPLEMENTED | SYNTAX               | DESCRIPTION
+        ------------------------------------------------------------------------------------------------------------
+        'S' |   ACK       |   Sn[CR]               The CAN Gateway cannot be changed over this tool
+            |             |                        Setup with standard CAN bit-rates where n is 0-8.
+            |             |                        S0 10Kbit,S4 125Kbit, S8 1Mbit, S1 20Kbit, S5 250Kbit, S9 83.3Kbit, S2 50Kbit, S6 500Kbit, S3 100Kbit, S7 800Kbit
+        's' |   ACK       |   sxxyy[CR]            Setup with BTR0/BTR1 CAN bit-rates where xx and yy is a hex value.
+        'O' |   ACK       |   O[CR]                Open the CAN channel in normal mode (sending & receiving).
+        'L' |   ACK       |   L[CR]                Open the CAN channel in listen only mode (receiving).
+        'C' |   YES       |   C[CR]                Close the CAN channel.
+        't' |   YES       |   tiiildd...[CR]       Transmit a standard (11bit) CAN frame.
+        'T' |   ACK       |   Tiiiiiiiildd...[CR]  Transmit an extended (29bit) CAN frame
+        'r' |   ACK       |   riiil[CR]            Transmit an standard RTR (11bit) CAN frame.
+        'R' |   ACK       |   Riiiiiiiil[CR]       Transmit an extended RTR (29bit) CAN frame.
+        'P' |   ACK       |   P[CR]                Poll incomming FIFO for CAN frames (single poll)
+        'A' |   ACK       |   A[CR]                Polls incomming FIFO for CAN frames (all pending frames)
+        'F' |   ACK       |   F[CR]                Read Status Flags: bit 0 = RX Fifo Full, 1 = TX Fifo Full, 2 = Error warning, 3 = Data overrun, 5= Error passive, 6 = Arb. Lost, 7 = Bus Error
+        'X' |   ACK       |   Xn[CR]               Sets Auto Poll/Send ON/OFF for received frames.
+        'W' |    -        |   Wn[CR]               Filter mode setting. By default CAN232 works in dual filter mode (0) and is backwards compatible with previous CAN232 versions.
+        'M' |    -        |   Mxxxxxxxx[CR]        Sets Acceptance Code Register (ACn Register of SJA1000). // we use MCP2515, not supported
+        'm' |    -        |   mxxxxxxxx[CR]        Sets Acceptance Mask Register (AMn Register of SJA1000). // we use MCP2515, not supported
+        'U' |   ACK       |   Un[CR]               Setup new UART baud rate n=0-6: 0-230400, 1:115200, 2:57600, 3:38400, 4:19200, 5:9600, 6:2400
+        'V' |   YES       |   v[CR]                Get Version number of both CAN232 hardware and software
+        'v' |   YES       |   V[CR]                Get Version number of both CAN232 hardware and software
+        'N' |   YES       |   N[CR]                Get Serial number of the CAN232.
+        'Z' |   YES       |   Zn[CR]               Sets Time Stamp ON/OFF for received frames only. EXTENSION to LAWICEL: Z2 - millis() timestamp w/o standard 60000ms cycle
+        'Q' |    -        |   Qn[CR]               Auto Startup feature (from power on).
+
+    */
+    // clang-format on
+
     if (Serial.available() == 0)
         return;
 
@@ -172,4 +225,11 @@ void send_ack() {
 
 void send_nack() {
     Serial.write('\a');  // NACK
+}
+
+unsigned short slcan_get_time() {
+    unsigned long current_time = millis();
+    unsigned short timestamp =
+        static_cast<unsigned short>(current_time % 60000);
+    return timestamp;
 }

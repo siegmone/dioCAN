@@ -201,7 +201,7 @@ void loop() {
         display_start();
         display.setTextSize(4);
         {
-            display_center(String("ZZZ"));
+            display_center(String("SLEEP"));
         }
         display_end();
         digitalWrite(GPIO_SLEEP_LED, LOW);
@@ -212,10 +212,10 @@ void loop() {
     display_start();
     {
         if (error_led_on) {
-            display.setTextSize(3);
-            display_center(String("ERROR!"));
+            display.setTextSize(4);
+            display_center(String("ERROR"));
         } else {
-            display.setTextSize(8);
+            display.setTextSize(4);
             display_center(String(unique_ids.size()));
         }
     }
