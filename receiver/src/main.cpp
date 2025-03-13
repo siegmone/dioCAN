@@ -16,6 +16,10 @@
 
 #include <unordered_map>
 
+#define EMPTY_MAP_TIME 30
+
+uint32_t last_empty_timestamp = 0;
+
 // SavvyCAN serial variables
 
 #define SERIAL_MAX_BUFF_LEN 30
@@ -64,9 +68,12 @@ void setup() {
 }
 
 void loop() {
+    uint32_t current_millis = millis();
+
     if (map_msgs.empty()) {
         return;
     }
+
     for (const auto &recv_pair : map_recv) {
         if (recv_pair.second) {
             esp_now_frame_t ef = map_msgs[recv_pair.first];
@@ -75,7 +82,12 @@ void loop() {
         }
         map_recv[recv_pair.first] = false;
     }
-    delay(100);
+
+    if (current_millis - last_empty_timestamp > EMPTY_MAP_TIME * 1000) {
+        map_recv.clear();
+        map_msgs.clear();
+        last_empty_timestamp = current_millis;
+    }
 }
 
 // esp_now recv callback

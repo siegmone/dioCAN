@@ -1,5 +1,5 @@
 // Decomment to display debug informations
-// #define DEBUG
+#define DEBUG
 
 #ifdef DEBUG
 #define debug(x)       Serial.print(x)
@@ -12,14 +12,13 @@
 #endif  // DEBUG
 
 // Decomment to enable the use of an i2c oled display
-// #define DISPLAY_ATTACHED
+#define DISPLAY_ATTACHED
 
 #include <Arduino.h>
 #include <WiFi.h>
 #include <esp_now.h>
 
 #include <algorithm>
-#include <unordered_map>
 #include <vector>
 
 #include "driver/gpio.h"
@@ -35,14 +34,12 @@
 #define SCREEN_HEIGHT 64   // OLED display height, in pixels
 // Declaration for an SSD1306 display connected to I2C (SDA, SCL pins)
 Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, -1);
-#define UNIQUE_ID_CHECK_TIMER 1000
-
 void display_start(void);
 void display_end(void);
 void display_center(String text);
 
-uint32_t last_ids_check_timestamp = 0;
-static std::unordered_map<uint32_t, uint32_t> active_ids;
+uint32_t last_check_fps_timestamp = 0;
+uint32_t frames_per_second_display = 0;
 #endif  // DISPLAY_ATTACHED
 
 // duration esp32 has to wait before going to sleep after no CAN avitivites in
@@ -73,8 +70,9 @@ uint32_t current_millis;
 uint32_t last_can_msg_timestamp = 0;
 uint32_t last_error_timestamp = 0;
 uint32_t wakeup_timestamp = 0;
+uint32_t frames_per_second = 0;
 
-// ESP-NOW comm
+// ESP-NOW communication
 
 typedef struct esp_now_frame_s {
     int mesh_id;
@@ -155,16 +153,12 @@ void loop() {
 
     if (alerts_triggered != 0) {
         if ((alerts_triggered & TWAI_ALERT_RX_DATA) != 0) {
-            uint32_t count = 0;
-            while (twai_receive(&message, 0) == ESP_OK && count < 100) {
-#ifdef DISPLAY_ATTACHED
-                active_ids[message.identifier] = current_millis;
-#endif
+            while (twai_receive(&message, 0) == ESP_OK) {
                 debug("New CAN ID detected: ");
                 debugf("%x", message.identifier);
                 debugln();
                 esp_now_send_can_msg(&message);
-                count++;
+                frames_per_second++;
             }
             last_can_msg_timestamp = millis();
             msg_received = true;
@@ -225,17 +219,19 @@ void loop() {
         return;
     }
 
-#ifdef DISPLAY_ATTACHED
-    if (current_millis - last_ids_check_timestamp > UNIQUE_ID_CHECK_TIMER) {
-        last_ids_check_timestamp = current_millis;
-        for (auto it = active_ids.begin(); it != active_ids.end();) {
-            if (current_millis - it->second > 1000) {
-                it = active_ids.erase(it);
-            } else {
-                ++it;
-            }
-        }
+    // Every reset timer every second
+    // TODO(siegmone): Should actually implement a real timer idk if the esp has
+    // one
+    if (current_millis - last_check_fps_timestamp > 1000) {
+        debugf("CAN-FPS: %2d", frames_per_second);
+        debugln();
+        last_check_fps_timestamp = current_millis;
+        frames_per_second_display = frames_per_second;
+        frames_per_second = 0;
     }
+
+
+#ifdef DISPLAY_ATTACHED
 
     display_start();
     {
@@ -244,7 +240,7 @@ void loop() {
             display_center(String("ERROR"));
         } else {
             display.setTextSize(4);
-            display_center(String(active_ids.size()));
+            display_center(String(frames_per_second_display));
         }
     }
     display_end();
