@@ -1,4 +1,5 @@
-#define DEBUG
+// Decomment to display debug informations
+// #define DEBUG
 
 #ifdef DEBUG
 #define debug(x)       Serial.print(x)
@@ -8,18 +9,23 @@
 #define debug(x)
 #define debugln(x)
 #define debugf(fmt, x)
-#endif
+#endif  // DEBUG
+
+// Decomment to enable the use of an i2c oled display
+// #define DISPLAY_ATTACHED
 
 #include <Arduino.h>
 #include <WiFi.h>
 #include <esp_now.h>
 
 #include <algorithm>
+#include <unordered_map>
 #include <vector>
 
 #include "driver/gpio.h"
 #include "driver/twai.h"
 
+#ifdef DISPLAY_ATTACHED
 // for display
 #include <Adafruit_GFX.h>
 #include <Adafruit_SSD1306.h>
@@ -29,6 +35,15 @@
 #define SCREEN_HEIGHT 64   // OLED display height, in pixels
 // Declaration for an SSD1306 display connected to I2C (SDA, SCL pins)
 Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, -1);
+#define UNIQUE_ID_CHECK_TIMER 1000
+
+void display_start(void);
+void display_end(void);
+void display_center(String text);
+
+uint32_t last_ids_check_timestamp = 0;
+static std::unordered_map<uint32_t, uint32_t> active_ids;
+#endif  // DISPLAY_ATTACHED
 
 // duration esp32 has to wait before going to sleep after no CAN avitivites in
 // (in milliseconds)
@@ -48,12 +63,9 @@ Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, -1);
 
 // Functions
 
-bool init_can(void);
-bool init_esp_now(void);
+bool can_setup(void);
+bool esp_now_setup(void);
 int get_mesh_id(void);
-void display_start(void);
-void display_end(void);
-void display_center(String text);
 
 // Global variables
 
@@ -100,13 +112,13 @@ void setup() {
 
     last_can_msg_timestamp = millis() - CAN_IDLE_TIMEOUT + 5;
 
-    if (!init_can()) {
+    if (!can_setup()) {
         debugln("Failed to init CAN");
         delay(60 * 1000);
         ESP.restart();
     }
 
-    if (!init_esp_now()) {
+    if (!esp_now_setup()) {
         debugln("Failed to init esp_now");
         delay(60 * 1000);
         ESP.restart();
@@ -114,12 +126,14 @@ void setup() {
     esp_now_mesh_id = get_mesh_id();
     debugln(esp_now_mesh_id);
 
+#ifdef DISPLAY_ATTACHED
     // Address 0x3D for 128x64. Changed D to C
     if (!display.begin(SSD1306_SWITCHCAPVCC, 0x3C)) {
         debugln(F("SSD1306 allocation failed"));
         delay(60 * 1000);
         ESP.restart();
     }
+#endif
 
     wakeup_timestamp = millis();
 
@@ -130,9 +144,8 @@ void setup() {
 }
 
 void loop() {
-    static std::vector<uint32_t> unique_ids;
-    static bool error_led_on =
-        false;  // Variable to determine if LED should blink
+    // Variable to determine if LED should blink
+    static bool error_led_on = false;
     current_millis = millis();
 
     twai_message_t message;
@@ -142,18 +155,19 @@ void loop() {
 
     if (alerts_triggered != 0) {
         if ((alerts_triggered & TWAI_ALERT_RX_DATA) != 0) {
-            while (twai_receive(&message, 0) == ESP_OK) {
-                if (std::find(unique_ids.begin(), unique_ids.end(),
-                              message.identifier) == unique_ids.end()) {
-                    unique_ids.push_back(message.identifier);
-                    debug("New CAN ID detected: ");
-                    debugf("%x", message.identifier);
-                    debugln();
-                }
+            uint32_t count = 0;
+            while (twai_receive(&message, 0) == ESP_OK && count < 100) {
+#ifdef DISPLAY_ATTACHED
+                active_ids[message.identifier] = current_millis;
+#endif
+                debug("New CAN ID detected: ");
+                debugf("%x", message.identifier);
+                debugln();
+                esp_now_send_can_msg(&message);
+                count++;
             }
             last_can_msg_timestamp = millis();
             msg_received = true;
-            esp_now_send_can_msg(&message);
         }
 
         if ((alerts_triggered & TWAI_ALERT_ERR_PASS) != 0) {
@@ -198,15 +212,29 @@ void loop() {
 
     if (current_millis - last_can_msg_timestamp > CAN_IDLE_TIMEOUT &&
         !msg_received && (current_millis - wakeup_timestamp > GRACE_PERIOD)) {
+#ifdef DISPLAY_ATTACHED
         display_start();
         display.setTextSize(4);
         {
             display_center(String("SLEEP"));
         }
         display_end();
+#endif  // DISPLAY_ATTACHED
         digitalWrite(GPIO_SLEEP_LED, LOW);
         esp_deep_sleep(1e6 * SLEEP_PERIOD_SEC);
         return;
+    }
+
+#ifdef DISPLAY_ATTACHED
+    if (current_millis - last_ids_check_timestamp > UNIQUE_ID_CHECK_TIMER) {
+        last_ids_check_timestamp = current_millis;
+        for (auto it = active_ids.begin(); it != active_ids.end();) {
+            if (current_millis - it->second > 1000) {
+                it = active_ids.erase(it);
+            } else {
+                ++it;
+            }
+        }
     }
 
     display_start();
@@ -216,13 +244,14 @@ void loop() {
             display_center(String("ERROR"));
         } else {
             display.setTextSize(4);
-            display_center(String(unique_ids.size()));
+            display_center(String(active_ids.size()));
         }
     }
     display_end();
+#endif  // DISPLAY_ATTACHED
 }
 
-bool init_can() {
+bool can_setup() {
     // Initialize configuration structures using macro initializers
     twai_general_config_t g_config =
         TWAI_GENERAL_CONFIG_DEFAULT(GPIO_CAN_TX, GPIO_CAN_RX, TWAI_MODE_NORMAL);
@@ -257,7 +286,7 @@ bool init_can() {
     return true;
 }
 
-bool init_esp_now() {
+bool esp_now_setup() {
     WiFi.mode(WIFI_STA);
     WiFi.disconnect();
 
@@ -289,6 +318,7 @@ int get_mesh_id() {
     return (int)uuid;
 }
 
+#ifdef DISPLAY_ATTACHED
 void display_start() {
     display.clearDisplay();
     display.setTextColor(WHITE);
@@ -311,3 +341,4 @@ void display_center(String text) {
     display.setCursor((SCREEN_WIDTH - width) / 2, (SCREEN_HEIGHT - height) / 2);
     display.println(text);  // text to display
 }
+#endif  // DISPLAY_ATTACHED

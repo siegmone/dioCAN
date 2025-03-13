@@ -14,7 +14,17 @@
 #include <WiFi.h>
 #include <esp_now.h>
 
-#include "ringbuffer.h"
+#include <unordered_map>
+
+// SavvyCAN serial variables
+
+#define SERIAL_MAX_BUFF_LEN 30
+char slcan_com[SERIAL_MAX_BUFF_LEN];
+bool send_ok = true;
+bool send_can_msgs = true;
+bool send_timestamp = true;
+
+// ESP-NOW definitions
 
 #define MESH_ID 18460
 
@@ -25,17 +35,7 @@ typedef struct esp_now_frame_s {
     uint8_t data[8];
 } esp_now_frame_t;
 
-RingBuffer<esp_now_frame_t, 128> rb;
-
-#define SERIAL_MAX_BUFF_LEN 30
-char slcan_com[SERIAL_MAX_BUFF_LEN];
-bool send_ok = true;
-bool got_new_can_msg = false;
-bool send_can_msgs = true;
-bool send_timestamp = true;
-
-// esp_now recv callback
-
+// ESP-NOW recv callback
 void recv_cb(const uint8_t *mac, const uint8_t *data, int len);
 
 // SavvyCAN functions
@@ -44,6 +44,11 @@ void handle_serial(void);
 void send_ack(void);
 void send_nack(void);
 unsigned short slcan_get_time(void);
+
+// map that checks which msg has been recvd
+static std::unordered_map<uint32_t, bool> map_recv;
+// map that holds the most recent can_messages
+static std::unordered_map<uint32_t, esp_now_frame_t> map_msgs;
 
 void setup() {
     Serial.begin(115200);
@@ -54,32 +59,44 @@ void setup() {
         return;
     }
     esp_now_register_recv_cb(recv_cb);
+
+    delay(500);
 }
 
 void loop() {
-    if (!rb.empty()) {
-        std::vector<esp_now_frame_t> emitted_frames = rb.emit();
-        for (auto ef : emitted_frames) {
+    if (map_msgs.empty()) {
+        return;
+    }
+    for (const auto &recv_pair : map_recv) {
+        if (recv_pair.second) {
+            esp_now_frame_t ef = map_msgs[recv_pair.first];
             send_can_over_serial(&ef);
             handle_serial();
         }
+        map_recv[recv_pair.first] = false;
     }
+    delay(100);
 }
 
 // esp_now recv callback
-
 void recv_cb(const uint8_t *mac, const uint8_t *data, int len) {
     esp_now_frame_t esp_now_frame;
     memcpy(&esp_now_frame, data, sizeof(esp_now_frame));
-    if (!rb.push(esp_now_frame)) {
-        debugln("RingBuffer is full");
-    }
+    map_msgs[esp_now_frame.can_id] = esp_now_frame;
+    map_recv[esp_now_frame.can_id] = true;
 }
 
 // SavvyCAN functions
-
 void send_can_over_serial(const esp_now_frame_t *ef) {
-    char buf[45];
+    // total_buf_size:
+    // + can_id(9)
+    // + dlc(1)
+    // + data(16)
+    // + timestamp(4)
+    // + carriage_return(1)
+    // + null_byte(1)
+    // = 32
+    char buf[36];
     int idx = 0;
 
     if (ef->can_id <= 0x7FF) {
