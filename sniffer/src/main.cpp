@@ -152,6 +152,15 @@ void loop() {
     twai_read_alerts(&alerts_triggered, pdMS_TO_TICKS(POLLING_RATE_MS));
 
     if (alerts_triggered != 0) {
+        // enabled alerts:
+        // - TWAI_ALERT_RX_DATA
+        // - TWAI_ALERT_ERR_PASS
+        // - TWAI_ALERT_BUS_ERROR
+        // - TWAI_ALERT_RX_QUEUE_FULL
+        // - TWAI_ALERT_BUS_OFF
+        // - TWAI_ALERT_ABOVE_ERR_WARN
+        // - TWAI_ALERT_RX_FIFO_OVERRUN
+
         if ((alerts_triggered & TWAI_ALERT_RX_DATA) != 0) {
             while (twai_receive(&message, 0) == ESP_OK) {
                 debug("New CAN ID detected: ");
@@ -189,6 +198,26 @@ void loop() {
             // debugf("RX overrun %d\n", twaistatus.rx_overrun_count);
             error_led_on = true;
             debugln(" CAN MSG.........Q FULL");
+        }
+
+        if ((alerts_triggered & TWAI_ALERT_BUS_OFF) != 0) {
+            debugln(
+                "Alert: Bus-off condition occurred. TWAI controller can no "
+                "longer influence bus");
+            error_led_on = true;
+            debugln(" CAN MSG........BUS OFF");
+        }
+
+        if ((alerts_triggered & TWAI_ALERT_ABOVE_ERR_WARN) != 0) {
+            debugln("Alert: One of the error counters have exceeded the error warning limit");
+            error_led_on = true;
+            debugln(" CAN MSG.......WARN ERR");
+        }
+
+        if ((alerts_triggered & TWAI_ALERT_RX_FIFO_OVERRUN) != 0) {
+            debugln("Alert: An RX FIFO overrun has occurred");
+            error_led_on = true;
+            debugln(" CAN MSG........FIFO OR");
         }
 
         // blink LED if needed
@@ -229,7 +258,6 @@ void loop() {
         frames_per_second_display = frames_per_second;
         frames_per_second = 0;
     }
-
 
 #ifdef DISPLAY_ATTACHED
 
@@ -272,7 +300,10 @@ bool can_setup() {
 
     // Reconfigure alerts to detect Error Passive and Bus-Off error states
     uint32_t alerts_to_enable =
-        TWAI_ALERT_ERR_PASS | TWAI_ALERT_BUS_OFF | TWAI_ALERT_RX_DATA;
+        TWAI_ALERT_ERR_PASS | TWAI_ALERT_BUS_OFF | TWAI_ALERT_RX_DATA |
+        TWAI_ALERT_ABOVE_ERR_WARN | TWAI_ALERT_BUS_ERROR |
+        TWAI_ALERT_RX_QUEUE_FULL | TWAI_ALERT_RX_FIFO_OVERRUN;
+
     if (twai_reconfigure_alerts(alerts_to_enable, NULL) == ESP_OK) {
         printf("Alerts reconfigured\n");
     } else {
