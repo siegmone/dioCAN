@@ -1,4 +1,19 @@
-// Decomment to display debug informations
+/*
+ */
+
+#include <Arduino.h>
+#include <WiFi.h>
+#include <esp_now.h>
+
+#include <algorithm>
+#include <vector>
+
+#include "driver/gpio.h"
+#include "driver/timer.h"
+#include "driver/twai.h"
+
+// DEBUG INFO OPTION
+// decomment to display debug informations
 #define DEBUG
 
 #ifdef DEBUG
@@ -11,69 +26,16 @@
 #define debugf(fmt, x)
 #endif  // DEBUG
 
-// Decomment to enable the use of an i2c oled display
-#define DISPLAY_ATTACHED
-
-#include <Arduino.h>
-#include <WiFi.h>
-#include <esp_now.h>
-
-#include <algorithm>
-#include <vector>
-
-#include "driver/gpio.h"
-#include "driver/twai.h"
-
-#ifdef DISPLAY_ATTACHED
-// for display
-#include <Adafruit_GFX.h>
-#include <Adafruit_SSD1306.h>
-#include <Wire.h>
-
-#define SCREEN_WIDTH  128  // OLED display width, in pixels
-#define SCREEN_HEIGHT 64   // OLED display height, in pixels
-// Declaration for an SSD1306 display connected to I2C (SDA, SCL pins)
-Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, -1);
-void display_start(void);
-void display_end(void);
-void display_center(String text);
-
-uint32_t last_check_fps_timestamp = 0;
-uint32_t frames_per_second_display = 0;
-#endif  // DISPLAY_ATTACHED
-
-// duration esp32 has to wait before going to sleep after no CAN avitivites in
-// (in milliseconds)
-#define CAN_IDLE_TIMEOUT 800
-// duration ESP32 will sleep for (in seconds)
-#define SLEEP_PERIOD_SEC 5
+// timeouts
 #define POLLING_RATE_MS  100
-#define ERROR_TIMEOUT    500
-#define GRACE_PERIOD     CAN_IDLE_TIMEOUT
+#define ERROR_TIMEOUT_MS 500
 
-// Pin definitions
-
-#define GPIO_ERROR_LED GPIO_NUM_17
-#define GPIO_SLEEP_LED GPIO_NUM_5
+// pin definitions
+#define GPIO_ERROR_LED GPIO_NUM_22
 #define GPIO_CAN_TX    GPIO_NUM_18
 #define GPIO_CAN_RX    GPIO_NUM_19
 
-// Functions
-
-bool can_setup(void);
-bool esp_now_setup(void);
-int get_mesh_id(void);
-
-// Global variables
-
-uint32_t current_millis;
-uint32_t last_can_msg_timestamp = 0;
-uint32_t last_error_timestamp = 0;
-uint32_t wakeup_timestamp = 0;
-uint32_t frames_per_second = 0;
-
 // ESP-NOW communication
-
 typedef struct esp_now_frame_s {
     int mesh_id;
     uint32_t can_id;
@@ -81,11 +43,11 @@ typedef struct esp_now_frame_s {
     uint8_t data[8];
 } esp_now_frame_t;
 
-esp_now_frame_t esp_now_frame;
+static esp_now_frame_t esp_now_frame;
 
-uint8_t broadcast_addr[] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
-esp_now_peer_info_t peer_info;
-int esp_now_mesh_id;
+static uint8_t broadcast_addr[] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
+static esp_now_peer_info_t peer_info;
+static int esp_now_mesh_id;
 
 static void esp_now_send_can_msg(twai_message_t* msg) {
     esp_err_t err;
@@ -100,15 +62,53 @@ static void esp_now_send_can_msg(twai_message_t* msg) {
     }
 }
 
+twai_message_t message;
+
+// status variables
+static bool error_flag = false;
+static bool msg_received_flag = false;
+
+// functions
+bool can_setup(void);
+bool esp_now_setup(void);
+int get_mesh_id(void);
+
+// timer
+#define TIMER_DIVIDER (16)
+#define TIMER_SCALE   (TIMER_BASE_CLK / TIMER_DIVIDER)
+
+static timer_group_t group = TIMER_GROUP_0;
+static timer_idx_t timer = TIMER_0;
+
+static bool IRAM_ATTR timer_callback(void* args) {
+    if (!error_flag) {
+        // No new errors for 1 second, turn off LED
+        digitalWrite(GPIO_ERROR_LED, LOW);
+        timer_pause(group, timer);  // Stop timer until next error
+    } else {
+        // Reset flag for next cycle, but keep timer running
+        error_flag = false;
+    }
+
+    // Reset counter for next cycle
+    timer_set_counter_value(group, timer, 0);
+    return true;
+}
+
+// tasks
+void esp_now_task(void* parameters);
+void can_task(void* parameters);
+
+// START SETUP
+
 void setup() {
 #ifdef DEBUG
     Serial.begin(115200);
 #endif
 
     pinMode(GPIO_ERROR_LED, OUTPUT);
-    pinMode(GPIO_SLEEP_LED, OUTPUT);
 
-    last_can_msg_timestamp = millis() - CAN_IDLE_TIMEOUT + 5;
+    digitalWrite(GPIO_ERROR_LED, HIGH);
 
     if (!can_setup()) {
         debugln("Failed to init CAN");
@@ -122,157 +122,153 @@ void setup() {
         ESP.restart();
     }
     esp_now_mesh_id = get_mesh_id();
+    debug("Mesh ID: ");
     debugln(esp_now_mesh_id);
 
-#ifdef DISPLAY_ATTACHED
-    // Address 0x3D for 128x64. Changed D to C
-    if (!display.begin(SSD1306_SWITCHCAPVCC, 0x3C)) {
-        debugln(F("SSD1306 allocation failed"));
-        delay(60 * 1000);
-        ESP.restart();
-    }
-#endif
+    // START TIMER
+    // APB_CLK = 80MHz
+    timer_config_t timer_config = {};
+    timer_config.divider = TIMER_DIVIDER;
+    timer_config.counter_dir = TIMER_COUNT_UP;
+    timer_config.counter_en = TIMER_PAUSE;
+    timer_config.auto_reload = TIMER_AUTORELOAD_EN;
+    timer_config.alarm_en = TIMER_ALARM_EN;
 
-    wakeup_timestamp = millis();
+    timer_init(group, timer, &timer_config);
+    timer_set_counter_value(group, timer, 0);
 
-    digitalWrite(GPIO_ERROR_LED, LOW);
-    digitalWrite(GPIO_SLEEP_LED, HIGH);
+    uint64_t alarm_value = ERROR_TIMEOUT_MS * (TIMER_SCALE / 1000);
+    timer_set_alarm_value(group, timer, alarm_value);
+    timer_enable_intr(group, timer);
+    timer_isr_callback_add(group, timer, timer_callback, NULL, 0);
+    // END TIMER
+
+    xTaskCreate(can_task, "CAN Task", 4096, NULL, 1, NULL);
+    xTaskCreate(esp_now_task, "ESP NOW Task", 4096, NULL, 2, NULL);
 
     delay(1000);
+    digitalWrite(GPIO_ERROR_LED, LOW);
 }
 
+// END SETUP
+
+// EMPTY LOOP
 void loop() {
-    // Variable to determine if LED should blink
-    static bool error_led_on = false;
-    current_millis = millis();
+}
 
-    twai_message_t message;
-    bool msg_received = false;
-    uint32_t alerts_triggered;
-    twai_read_alerts(&alerts_triggered, pdMS_TO_TICKS(POLLING_RATE_MS));
+// tasks
+void esp_now_task(void* parameters) {
+    for (;;) {
+        esp_now_send_can_msg(&message);
+        vTaskDelay(pdMS_TO_TICKS(500));
+    }
+}
 
-    if (alerts_triggered != 0) {
-        // enabled alerts:
-        // - TWAI_ALERT_RX_DATA
-        // - TWAI_ALERT_ERR_PASS
-        // - TWAI_ALERT_BUS_ERROR
-        // - TWAI_ALERT_RX_QUEUE_FULL
-        // - TWAI_ALERT_BUS_OFF
-        // - TWAI_ALERT_ABOVE_ERR_WARN
-        // - TWAI_ALERT_RX_FIFO_OVERRUN
+void can_task(void* parameters) {
+    for (;;) {
+        uint32_t alerts_triggered;
+        twai_read_alerts(&alerts_triggered, pdMS_TO_TICKS(POLLING_RATE_MS));
 
-        if ((alerts_triggered & TWAI_ALERT_RX_DATA) != 0) {
-            while (twai_receive(&message, 0) == ESP_OK) {
-                debug("New CAN ID detected: ");
-                debugf("%x", message.identifier);
-                debugln();
-                esp_now_send_can_msg(&message);
-                frames_per_second++;
+        twai_status_info_t twai_status;
+
+        if (alerts_triggered != 0) {
+            twai_get_status_info(&twai_status);
+            debugln();
+            debugln("CAN STATE:");
+            debug("\t");
+            switch (twai_status.state) {
+                case TWAI_STATE_STOPPED: {
+                    debugln("TWAI_STATE_STOPPED");
+                } break;
+                case TWAI_STATE_RUNNING: {
+                    debugln("TWAI_STATE_RUNNING");
+                } break;
+                case TWAI_STATE_BUS_OFF: {
+                    debugln("TWAI_STATE_BUS_OFF");
+                } break;
+                case TWAI_STATE_RECOVERING: {
+                    debugln("TWAI_STATE_RECOVERING");
+                } break;
+                default:
+                    break;
             }
-            last_can_msg_timestamp = millis();
-            msg_received = true;
-        }
 
-        if ((alerts_triggered & TWAI_ALERT_ERR_PASS) != 0) {
-            debugln("Alert: TWAI controller has become error passive.");
-            error_led_on = true;
-            debugln(" CAN MSG..........ERROR");
-        }
+            // enabled alerts:
+            // - TWAI_ALERT_RX_DATA
+            // - TWAI_ALERT_ERR_PASS
+            // - TWAI_ALERT_BUS_ERROR
+            // - TWAI_ALERT_RX_QUEUE_FULL
+            // - TWAI_ALERT_BUS_OFF
+            // - TWAI_ALERT_ABOVE_ERR_WARN
+            // - TWAI_ALERT_RX_FIFO_OVERRUN
+            if ((alerts_triggered & TWAI_ALERT_RX_DATA) != 0) {
+                debugln("CAN OK: MSG RECV");
+                while (twai_receive(&message, 0) == ESP_OK) {
+                }
+                msg_received_flag = true;
+            }
 
-        if ((alerts_triggered & TWAI_ALERT_BUS_ERROR) != 0) {
-            debugln(
-                "Alert: A (Bit, Stuff, CRC, Form, ACK) error has occurred on "
-                "the bus.");
-            // debugf("Bus error count: %d\n",
-            // twaistatus.bus_error_count);
-            error_led_on = true;
-            debugln(" CAN MSG......BUS ERROR");
-        }
+            if ((alerts_triggered & TWAI_ALERT_ERR_PASS) != 0) {
+                debugln("Alert: TWAI controller has become error passive.");
+                error_flag = true;
+                debugln("CAN ERROR: ERR PASS");
+            }
 
-        if ((alerts_triggered & TWAI_ALERT_RX_QUEUE_FULL) != 0) {
-            debugln(
-                "Alert: The RX queue is full causing a received frame to be "
-                "lost.");
-            // debugf("RX buffered: %d\t", twaistatus.msgs_to_rx);
-            // debugf("RX missed: %d\t", twaistatus.rx_missed_count);
-            // debugf("RX overrun %d\n", twaistatus.rx_overrun_count);
-            error_led_on = true;
-            debugln(" CAN MSG.........Q FULL");
-        }
+            if ((alerts_triggered & TWAI_ALERT_BUS_ERROR) != 0) {
+                debugln(
+                    "Alert: A (Bit, Stuff, CRC, Form, ACK) error has occurred "
+                    "on "
+                    "the bus.");
+                debugf("Bus error count: %d\n", twai_status.bus_error_count);
+                debugln();
+                error_flag = true;
+                debugln("CAN ERROR: BUS ERROR");
+            }
 
-        if ((alerts_triggered & TWAI_ALERT_BUS_OFF) != 0) {
-            debugln(
-                "Alert: Bus-off condition occurred. TWAI controller can no "
-                "longer influence bus");
-            error_led_on = true;
-            debugln(" CAN MSG........BUS OFF");
-        }
+            if ((alerts_triggered & TWAI_ALERT_RX_QUEUE_FULL) != 0) {
+                debugln(
+                    "Alert: The RX queue is full causing a received frame to "
+                    "be "
+                    "lost.");
+                debugf("\tRX buffered: %d", twai_status.msgs_to_rx);
+                debugln();
+                debugf("\tRX missed: %d", twai_status.rx_missed_count);
+                debugln();
+                debugf("\tRX overrun %d", twai_status.rx_overrun_count);
+                debugln();
+                error_flag = true;
+                debugln("CAN ERROR: RX QUEUE FULL");
+            }
 
-        if ((alerts_triggered & TWAI_ALERT_ABOVE_ERR_WARN) != 0) {
-            debugln("Alert: One of the error counters have exceeded the error warning limit");
-            error_led_on = true;
-            debugln(" CAN MSG.......WARN ERR");
-        }
+            if ((alerts_triggered & TWAI_ALERT_BUS_OFF) != 0) {
+                debugln(
+                    "Alert: Bus-off condition occurred. TWAI controller can no "
+                    "longer influence bus");
+                error_flag = true;
+                debugln("CAN ERROR: BUS OFF");
+            }
 
-        if ((alerts_triggered & TWAI_ALERT_RX_FIFO_OVERRUN) != 0) {
-            debugln("Alert: An RX FIFO overrun has occurred");
-            error_led_on = true;
-            debugln(" CAN MSG........FIFO OR");
-        }
+            if ((alerts_triggered & TWAI_ALERT_ABOVE_ERR_WARN) != 0) {
+                debugln(
+                    "Alert: One of the error counters have exceeded the error "
+                    "warning limit");
+                error_flag = true;
+                debugln("CAN ERROR: ABOVE ERR WARNING LIMIT");
+            }
 
+            if ((alerts_triggered & TWAI_ALERT_RX_FIFO_OVERRUN) != 0) {
+                debugln("Alert: An RX FIFO overrun has occurred");
+                error_flag = true;
+                debugln("CAN ERROR: RX FIFO OVERRUN");
+            }
+        }
         // blink LED if needed
-        if (error_led_on) {
+        if (error_flag) {
             digitalWrite(GPIO_ERROR_LED, HIGH);
-            last_error_timestamp = current_millis;
+            timer_start(group, timer);
         }
+        vTaskDelay(pdMS_TO_TICKS(10));
     }
-
-    if (current_millis - last_error_timestamp >= ERROR_TIMEOUT) {
-        digitalWrite(GPIO_ERROR_LED, LOW);
-        last_error_timestamp = 0;
-        error_led_on = false;
-    }
-
-    if (current_millis - last_can_msg_timestamp > CAN_IDLE_TIMEOUT &&
-        !msg_received && (current_millis - wakeup_timestamp > GRACE_PERIOD)) {
-#ifdef DISPLAY_ATTACHED
-        display_start();
-        display.setTextSize(4);
-        {
-            display_center(String("SLEEP"));
-        }
-        display_end();
-#endif  // DISPLAY_ATTACHED
-        digitalWrite(GPIO_SLEEP_LED, LOW);
-        esp_deep_sleep(1e6 * SLEEP_PERIOD_SEC);
-        return;
-    }
-
-    // Every reset timer every second
-    // TODO(siegmone): Should actually implement a real timer idk if the esp has
-    // one
-    if (current_millis - last_check_fps_timestamp > 1000) {
-        debugf("CAN-FPS: %2d", frames_per_second);
-        debugln();
-        last_check_fps_timestamp = current_millis;
-        frames_per_second_display = frames_per_second;
-        frames_per_second = 0;
-    }
-
-#ifdef DISPLAY_ATTACHED
-
-    display_start();
-    {
-        if (error_led_on) {
-            display.setTextSize(4);
-            display_center(String("ERROR"));
-        } else {
-            display.setTextSize(4);
-            display_center(String(frames_per_second_display));
-        }
-    }
-    display_end();
-#endif  // DISPLAY_ATTACHED
 }
 
 bool can_setup() {
@@ -344,28 +340,3 @@ int get_mesh_id() {
     uuid %= 32768;
     return (int)uuid;
 }
-
-#ifdef DISPLAY_ATTACHED
-void display_start() {
-    display.clearDisplay();
-    display.setTextColor(WHITE);
-    display.setCursor(0, 0);
-}
-
-void display_end() {
-    display.display();
-}
-
-void display_center(String text) {
-    int16_t x1;
-    int16_t y1;
-    uint16_t width;
-    uint16_t height;
-
-    display.getTextBounds(text, 0, 0, &x1, &y1, &width, &height);
-
-    // display on horizontal and vertical center
-    display.setCursor((SCREEN_WIDTH - width) / 2, (SCREEN_HEIGHT - height) / 2);
-    display.println(text);  // text to display
-}
-#endif  // DISPLAY_ATTACHED
