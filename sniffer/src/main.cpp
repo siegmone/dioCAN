@@ -14,26 +14,22 @@
 
 // DEBUG INFO OPTION
 // decomment to display debug informations
-#define DEBUG
+// #define DEBUG
 
 #ifdef DEBUG
-#define debug(x)       Serial.print(x)
-#define debugln(x)     Serial.println(x)
+#define debug(x)         Serial.print(x)
+#define debugln(x)       Serial.println(x)
 #define debugf(fmt, ...) Serial.printf(fmt, __VA_ARGS__)
 #else
 #define debug(x)
 #define debugln(x)
-#define debugf(fmt, x)
+#define debugf(fmt, ...)
 #endif  // DEBUG
 
-// timeouts
-#define POLLING_RATE_MS  5
-#define ERROR_TIMEOUT_MS 500
-
 // pin definitions
-#define GPIO_ERROR_LED GPIO_NUM_22
-#define GPIO_CAN_TX    GPIO_NUM_18
-#define GPIO_CAN_RX    GPIO_NUM_19
+#define GPIO_ERROR_LED   GPIO_NUM_22
+#define GPIO_CAN_TX      GPIO_NUM_18
+#define GPIO_CAN_RX      GPIO_NUM_19
 
 // ESP-NOW communication
 typedef struct esp_now_frame_s {
@@ -77,26 +73,55 @@ void can_check_status(void);
 bool esp_now_setup(void);
 int get_mesh_id(void);
 
+// timeouts
+#define POLLING_RATE_MS   5
+#define ERROR_TIMEOUT_MS  500
+#define SLEEP_TIMEOUT_MS  1000
+#define SLEEP_DURATION_MS 10000
+
 // timer
 #define TIMER_DIVIDER (16)
 #define TIMER_SCALE   (TIMER_BASE_CLK / TIMER_DIVIDER)
 
-static timer_group_t group = TIMER_GROUP_0;
-static timer_idx_t timer = TIMER_0;
+static timer_group_t timer_group = TIMER_GROUP_0;
+static timer_idx_t error_timer = TIMER_0;
+static timer_idx_t sleep_timer = TIMER_1;
 
-static bool IRAM_ATTR timer_callback(void* args) {
+static bool IRAM_ATTR error_timer_callback(void* args) {
     if (!error_flag) {
         // No new errors for 1 second, turn off LED
         digitalWrite(GPIO_ERROR_LED, LOW);
-        timer_pause(group, timer);  // Stop timer until next error
-    } else {
-        // Reset flag for next cycle, but keep timer running
-        error_flag = false;
+        // Stop timer until next error
+        timer_pause(timer_group, error_timer);
     }
 
+    error_flag = false;
     // Reset counter for next cycle
-    timer_set_counter_value(group, timer, 0);
+    timer_set_counter_value(timer_group, error_timer, 0);
     return true;
+}
+
+static bool IRAM_ATTR sleep_timer_callback(void* args) {
+    debugln("Going to sleep");
+    timer_set_counter_value(timer_group, sleep_timer, 0);
+    if (!msg_received_flag) {
+        timer_pause(timer_group, sleep_timer);
+        esp_deep_sleep(SLEEP_DURATION_MS * 1000);
+    }
+    return true;
+}
+
+static void timer_setup(timer_group_t group, timer_idx_t timer,
+                        timer_config_t* config, timer_isr_t callback,
+                        uint32_t milliseconds) {
+    timer_init(group, timer, config);
+    timer_set_counter_value(group, timer, 0);
+
+    float seconds = milliseconds * 0.001;
+    uint64_t alarm_value = seconds * (TIMER_SCALE);
+    timer_set_alarm_value(group, timer, alarm_value);
+    timer_enable_intr(group, timer);
+    timer_isr_callback_add(group, timer, callback, NULL, 0);
 }
 
 // tasks
@@ -141,13 +166,10 @@ void setup() {
     timer_config.auto_reload = TIMER_AUTORELOAD_EN;
     timer_config.alarm_en = TIMER_ALARM_EN;
 
-    timer_init(group, timer, &timer_config);
-    timer_set_counter_value(group, timer, 0);
-
-    uint64_t alarm_value = ERROR_TIMEOUT_MS * (TIMER_SCALE / 1000);
-    timer_set_alarm_value(group, timer, alarm_value);
-    timer_enable_intr(group, timer);
-    timer_isr_callback_add(group, timer, timer_callback, NULL, 0);
+    timer_setup(timer_group, error_timer, &timer_config, error_timer_callback,
+                ERROR_TIMEOUT_MS);
+    timer_setup(timer_group, sleep_timer, &timer_config, sleep_timer_callback,
+                SLEEP_TIMEOUT_MS);
     // END TIMER
 
     xTaskCreatePinnedToCore(can_task, "CAN Task", 4096, NULL, 1, NULL, 0);
@@ -173,14 +195,21 @@ void esp_now_task(void* parameters) {
 }
 
 void can_task(void* parameters) {
+    timer_start(timer_group, sleep_timer);
     for (;;) {
+        msg_received_flag = false;
+
         can_check_alerts();
         // can_check_status();
 
         // check for error and light the led
         if (error_flag) {
             digitalWrite(GPIO_ERROR_LED, HIGH);
-            timer_start(group, timer);
+            timer_start(timer_group, error_timer);
+        }
+
+        if (msg_received_flag) {
+            timer_set_counter_value(timer_group, sleep_timer, 0);
         }
 
         vTaskDelay(pdMS_TO_TICKS(CAN_TASK_DELAY));
@@ -240,7 +269,8 @@ void can_check_alerts() {
         if ((alerts_triggered & TWAI_ALERT_RX_DATA) != 0) {
             debugln("CAN RECV.......OK");
             while (twai_receive(&message, 0) == ESP_OK) {
-                debugf("MSG............%03X  [%d]  ", message.identifier, message.data_length_code);
+                debugf("MSG............%03X  [%d]  ", message.identifier,
+                       message.data_length_code);
                 for (int i = 0; i < message.data_length_code; i++) {
                     debugf("%02X ", message.data[i]);
                 }
