@@ -19,7 +19,7 @@
 #ifdef DEBUG
 #define debug(x)       Serial.print(x)
 #define debugln(x)     Serial.println(x)
-#define debugf(fmt, x) Serial.printf(fmt, x)
+#define debugf(fmt, ...) Serial.printf(fmt, __VA_ARGS__)
 #else
 #define debug(x)
 #define debugln(x)
@@ -27,7 +27,7 @@
 #endif  // DEBUG
 
 // timeouts
-#define POLLING_RATE_MS  100
+#define POLLING_RATE_MS  5
 #define ERROR_TIMEOUT_MS 500
 
 // pin definitions
@@ -62,14 +62,18 @@ static void esp_now_send_can_msg(twai_message_t* msg) {
     }
 }
 
-twai_message_t message;
-
 // status variables
 static bool error_flag = false;
 static bool msg_received_flag = false;
 
+// twai variables
+twai_message_t message;
+twai_status_info_t twai_status;
+
 // functions
 bool can_setup(void);
+void can_check_alerts(void);
+void can_check_status(void);
 bool esp_now_setup(void);
 int get_mesh_id(void);
 
@@ -99,6 +103,10 @@ static bool IRAM_ATTR timer_callback(void* args) {
 void esp_now_task(void* parameters);
 void can_task(void* parameters);
 
+// task delays
+#define ESP_NOW_TASK_DELAY 500
+#define CAN_TASK_DELAY     5
+
 // START SETUP
 
 void setup() {
@@ -107,7 +115,6 @@ void setup() {
 #endif
 
     pinMode(GPIO_ERROR_LED, OUTPUT);
-
     digitalWrite(GPIO_ERROR_LED, HIGH);
 
     if (!can_setup()) {
@@ -143,10 +150,10 @@ void setup() {
     timer_isr_callback_add(group, timer, timer_callback, NULL, 0);
     // END TIMER
 
-    xTaskCreate(can_task, "CAN Task", 4096, NULL, 1, NULL);
-    xTaskCreate(esp_now_task, "ESP NOW Task", 4096, NULL, 2, NULL);
+    xTaskCreatePinnedToCore(can_task, "CAN Task", 4096, NULL, 1, NULL, 0);
+    xTaskCreatePinnedToCore(esp_now_task, "ESP NOW Task", 4096, NULL, 2, NULL, 1);
 
-    delay(1000);
+    delay(500);
     digitalWrite(GPIO_ERROR_LED, LOW);
 }
 
@@ -159,115 +166,24 @@ void loop() {
 // tasks
 void esp_now_task(void* parameters) {
     for (;;) {
+        debugln("ESPNOW SEND....OK");
         esp_now_send_can_msg(&message);
-        vTaskDelay(pdMS_TO_TICKS(500));
+        vTaskDelay(pdMS_TO_TICKS(ESP_NOW_TASK_DELAY));
     }
 }
 
 void can_task(void* parameters) {
     for (;;) {
-        uint32_t alerts_triggered;
-        twai_read_alerts(&alerts_triggered, pdMS_TO_TICKS(POLLING_RATE_MS));
+        can_check_alerts();
+        // can_check_status();
 
-        twai_status_info_t twai_status;
-
-        if (alerts_triggered != 0) {
-            twai_get_status_info(&twai_status);
-            debugln();
-            debugln("CAN STATE:");
-            debug("\t");
-            switch (twai_status.state) {
-                case TWAI_STATE_STOPPED: {
-                    debugln("TWAI_STATE_STOPPED");
-                } break;
-                case TWAI_STATE_RUNNING: {
-                    debugln("TWAI_STATE_RUNNING");
-                } break;
-                case TWAI_STATE_BUS_OFF: {
-                    debugln("TWAI_STATE_BUS_OFF");
-                } break;
-                case TWAI_STATE_RECOVERING: {
-                    debugln("TWAI_STATE_RECOVERING");
-                } break;
-                default:
-                    break;
-            }
-
-            // enabled alerts:
-            // - TWAI_ALERT_RX_DATA
-            // - TWAI_ALERT_ERR_PASS
-            // - TWAI_ALERT_BUS_ERROR
-            // - TWAI_ALERT_RX_QUEUE_FULL
-            // - TWAI_ALERT_BUS_OFF
-            // - TWAI_ALERT_ABOVE_ERR_WARN
-            // - TWAI_ALERT_RX_FIFO_OVERRUN
-            if ((alerts_triggered & TWAI_ALERT_RX_DATA) != 0) {
-                debugln("CAN OK: MSG RECV");
-                while (twai_receive(&message, 0) == ESP_OK) {
-                }
-                msg_received_flag = true;
-            }
-
-            if ((alerts_triggered & TWAI_ALERT_ERR_PASS) != 0) {
-                debugln("Alert: TWAI controller has become error passive.");
-                error_flag = true;
-                debugln("CAN ERROR: ERR PASS");
-            }
-
-            if ((alerts_triggered & TWAI_ALERT_BUS_ERROR) != 0) {
-                debugln(
-                    "Alert: A (Bit, Stuff, CRC, Form, ACK) error has occurred "
-                    "on "
-                    "the bus.");
-                debugf("Bus error count: %d\n", twai_status.bus_error_count);
-                debugln();
-                error_flag = true;
-                debugln("CAN ERROR: BUS ERROR");
-            }
-
-            if ((alerts_triggered & TWAI_ALERT_RX_QUEUE_FULL) != 0) {
-                debugln(
-                    "Alert: The RX queue is full causing a received frame to "
-                    "be "
-                    "lost.");
-                debugf("\tRX buffered: %d", twai_status.msgs_to_rx);
-                debugln();
-                debugf("\tRX missed: %d", twai_status.rx_missed_count);
-                debugln();
-                debugf("\tRX overrun %d", twai_status.rx_overrun_count);
-                debugln();
-                error_flag = true;
-                debugln("CAN ERROR: RX QUEUE FULL");
-            }
-
-            if ((alerts_triggered & TWAI_ALERT_BUS_OFF) != 0) {
-                debugln(
-                    "Alert: Bus-off condition occurred. TWAI controller can no "
-                    "longer influence bus");
-                error_flag = true;
-                debugln("CAN ERROR: BUS OFF");
-            }
-
-            if ((alerts_triggered & TWAI_ALERT_ABOVE_ERR_WARN) != 0) {
-                debugln(
-                    "Alert: One of the error counters have exceeded the error "
-                    "warning limit");
-                error_flag = true;
-                debugln("CAN ERROR: ABOVE ERR WARNING LIMIT");
-            }
-
-            if ((alerts_triggered & TWAI_ALERT_RX_FIFO_OVERRUN) != 0) {
-                debugln("Alert: An RX FIFO overrun has occurred");
-                error_flag = true;
-                debugln("CAN ERROR: RX FIFO OVERRUN");
-            }
-        }
-        // blink LED if needed
+        // check for error and light the led
         if (error_flag) {
             digitalWrite(GPIO_ERROR_LED, HIGH);
             timer_start(group, timer);
         }
-        vTaskDelay(pdMS_TO_TICKS(10));
+
+        vTaskDelay(pdMS_TO_TICKS(CAN_TASK_DELAY));
     }
 }
 
@@ -280,21 +196,21 @@ bool can_setup() {
 
     // Install TWAI driver
     if (twai_driver_install(&g_config, &t_config, &f_config) == ESP_OK) {
-        debugln("Driver installed\n");
+        debugln("CAN INSTALL....OK");
     } else {
-        debugln("Failed to install driver\n");
+        debugln("CAN INSTALL....FAIL");
         return false;
     }
 
     // Start TWAI driver
     if (twai_start() == ESP_OK) {
-        debugln("Driver started\n");
+        debugln("CAN STATE......OK");
     } else {
-        debugln("Failed to start driver\n");
+        debugln("CAN STATE......FAIL");
         return false;
     }
 
-    // Reconfigure alerts to detect Error Passive and Bus-Off error states
+    // Reconfigure alerts
     uint32_t alerts_to_enable =
         TWAI_ALERT_ERR_PASS | TWAI_ALERT_BUS_OFF | TWAI_ALERT_RX_DATA |
         TWAI_ALERT_ABOVE_ERR_WARN | TWAI_ALERT_BUS_ERROR |
@@ -307,6 +223,107 @@ bool can_setup() {
         return false;
     }
     return true;
+}
+
+void can_check_alerts() {
+    uint32_t alerts_triggered;
+    twai_read_alerts(&alerts_triggered, pdMS_TO_TICKS(POLLING_RATE_MS));
+    if (alerts_triggered != 0) {
+        // enabled alerts:
+        // - TWAI_ALERT_RX_DATA
+        // - TWAI_ALERT_ERR_PASS
+        // - TWAI_ALERT_BUS_ERROR
+        // - TWAI_ALERT_RX_QUEUE_FULL
+        // - TWAI_ALERT_BUS_OFF
+        // - TWAI_ALERT_ABOVE_ERR_WARN
+        // - TWAI_ALERT_RX_FIFO_OVERRUN
+        if ((alerts_triggered & TWAI_ALERT_RX_DATA) != 0) {
+            debugln("CAN RECV.......OK");
+            while (twai_receive(&message, 0) == ESP_OK) {
+                debugf("MSG............%03X  [%d]  ", message.identifier, message.data_length_code);
+                for (int i = 0; i < message.data_length_code; i++) {
+                    debugf("%02X ", message.data[i]);
+                }
+                debugln();
+            }
+            msg_received_flag = true;
+        }
+
+        if ((alerts_triggered & TWAI_ALERT_ERR_PASS) != 0) {
+            debugln("Alert: TWAI controller has become error passive.");
+            error_flag = true;
+            debugln("CAN ERROR......ERR PASS");
+        }
+
+        if ((alerts_triggered & TWAI_ALERT_BUS_ERROR) != 0) {
+            debugln(
+                "Alert: A (Bit, Stuff, CRC, Form, ACK) error has occurred "
+                "on "
+                "the bus.");
+            debugf("Bus error count: %d\n", twai_status.bus_error_count);
+            debugln();
+            error_flag = true;
+            debugln("CAN ERROR......BUS ERROR");
+        }
+
+        if ((alerts_triggered & TWAI_ALERT_RX_QUEUE_FULL) != 0) {
+            debugln(
+                "Alert: The RX queue is full causing a received frame to "
+                "be "
+                "lost.");
+            debugf("....RX buffered: %d", twai_status.msgs_to_rx);
+            debugln();
+            debugf("....RX missed: %d", twai_status.rx_missed_count);
+            debugln();
+            debugf("....RX overrun %d", twai_status.rx_overrun_count);
+            debugln();
+            error_flag = true;
+            debugln("CAN ERROR......RX QUEUE FULL");
+        }
+
+        if ((alerts_triggered & TWAI_ALERT_BUS_OFF) != 0) {
+            debugln(
+                "Alert: Bus-off condition occurred. TWAI controller can no "
+                "longer influence bus");
+            error_flag = true;
+            debugln("CAN ERROR......BUS OFF");
+        }
+
+        if ((alerts_triggered & TWAI_ALERT_ABOVE_ERR_WARN) != 0) {
+            debugln(
+                "Alert: One of the error counters have exceeded the error "
+                "warning limit");
+            error_flag = true;
+            debugln("CAN ERROR......ABOVE ERR WARNING LIMIT");
+        }
+
+        if ((alerts_triggered & TWAI_ALERT_RX_FIFO_OVERRUN) != 0) {
+            debugln("Alert: An RX FIFO overrun has occurred");
+            error_flag = true;
+            debugln("CAN ERROR......RX FIFO OVERRUN");
+        }
+    }
+}
+
+void can_check_status() {
+    twai_get_status_info(&twai_status);
+    debug("CAN STATE......");
+    switch (twai_status.state) {
+        case TWAI_STATE_STOPPED: {
+            debugln("TWAI_STATE_STOPPED");
+        } break;
+        case TWAI_STATE_RUNNING: {
+            debugln("TWAI_STATE_RUNNING");
+        } break;
+        case TWAI_STATE_BUS_OFF: {
+            debugln("TWAI_STATE_BUS_OFF");
+        } break;
+        case TWAI_STATE_RECOVERING: {
+            debugln("TWAI_STATE_RECOVERING");
+        } break;
+        default:
+            break;
+    }
 }
 
 bool esp_now_setup() {
