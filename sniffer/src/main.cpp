@@ -187,15 +187,20 @@ void loop() {
 
 // tasks
 void esp_now_task(void* parameters) {
+    TickType_t last_wake_time = xTaskGetTickCount();
+
     for (;;) {
         debugln("ESPNOW SEND....OK");
         esp_now_send_can_msg(&message);
-        vTaskDelay(pdMS_TO_TICKS(ESP_NOW_TASK_DELAY));
+        xTaskDelayUntil(&last_wake_time, pdMS_TO_TICKS(ESP_NOW_TASK_DELAY));
     }
 }
 
 void can_task(void* parameters) {
+    TickType_t last_wake_time = xTaskGetTickCount();
+
     timer_start(timer_group, sleep_timer);
+
     for (;;) {
         msg_received_flag = false;
 
@@ -212,14 +217,14 @@ void can_task(void* parameters) {
             timer_set_counter_value(timer_group, sleep_timer, 0);
         }
 
-        vTaskDelay(pdMS_TO_TICKS(CAN_TASK_DELAY));
+        xTaskDelayUntil(&last_wake_time, pdMS_TO_TICKS(CAN_TASK_DELAY));
     }
 }
 
 bool can_setup() {
     // Initialize configuration structures using macro initializers
     twai_general_config_t g_config =
-        TWAI_GENERAL_CONFIG_DEFAULT(GPIO_CAN_TX, GPIO_CAN_RX, TWAI_MODE_NORMAL);
+        TWAI_GENERAL_CONFIG_DEFAULT(GPIO_CAN_TX, GPIO_CAN_RX, TWAI_MODE_LISTEN_ONLY);
     twai_timing_config_t t_config = TWAI_TIMING_CONFIG_1MBITS();
     twai_filter_config_t f_config = TWAI_FILTER_CONFIG_ACCEPT_ALL();
 
