@@ -14,7 +14,7 @@
 
 // DEBUG INFO OPTION
 // decomment to display debug informations
-// #define DEBUG
+#define DEBUG
 
 #ifdef DEBUG
 #define debug(x)         Serial.print(x)
@@ -27,44 +27,105 @@
 #endif  // DEBUG
 
 // pin definitions
-#define GPIO_ERROR_LED   GPIO_NUM_22
-#define GPIO_CAN_TX      GPIO_NUM_18
-#define GPIO_CAN_RX      GPIO_NUM_19
+#define GPIO_ERROR_LED GPIO_NUM_22
+#define GPIO_CAN_TX    GPIO_NUM_18
+#define GPIO_CAN_RX    GPIO_NUM_19
+
+// twai variables
+#define MAX_CAN_IDS 256
+
+typedef struct can_message_s {
+    twai_message_t message;
+    bool updated;
+    uint64_t timestamp;
+} can_message_t;
+
+static can_message_t can_data_store[MAX_CAN_IDS];
+static SemaphoreHandle_t data_mutex;
+static uint16_t active_can_ids_count = 0;
+
+static int find_can_id_slot(uint32_t can_id) {
+    for (int i = 0; i < active_can_ids_count; i++) {
+        uint32_t stored_id;
+
+        if (can_data_store[i].message.flags & TWAI_MSG_FLAG_EXTD) {
+            stored_id = can_data_store[i].message.identifier;
+        } else {
+            stored_id = can_data_store[i].message.identifier & 0x7FF;
+        }
+
+        if (stored_id == can_id) {
+            return i;
+        }
+    }
+
+    if (active_can_ids_count < MAX_CAN_IDS) {
+        int new_index = active_can_ids_count++;
+        can_data_store[new_index].message.identifier = can_id;
+        can_data_store[new_index].message.data_length_code = 0;
+        can_data_store[new_index].updated = false;
+        return new_index;
+    }
+
+    // unreachable
+    debugln("UNREACHABLE");
+    debugln(
+        "Exceded MAX_CAN_IDS, please increase it to match the number of ids in "
+        "your network");
+    return -1;
+}
+
+twai_status_info_t twai_status;
 
 // ESP-NOW communication
-typedef struct esp_now_frame_s {
+typedef struct esp_now_packet_s {
+    uint64_t timestamp;
+    uint8_t data[8];
     int mesh_id;
     uint32_t can_id;
     uint8_t dlc;
-    uint8_t data[8];
-} esp_now_frame_t;
-
-static esp_now_frame_t esp_now_frame;
+} esp_now_packet_t;
 
 static uint8_t broadcast_addr[] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
 static esp_now_peer_info_t peer_info;
 static int esp_now_mesh_id;
 
-static void esp_now_send_can_msg(twai_message_t* msg) {
+static esp_err_t esp_now_send_can_msg(can_message_t* msg) {
     esp_err_t err;
-    esp_now_frame.mesh_id = esp_now_mesh_id;
-    esp_now_frame.can_id = msg->identifier;
-    esp_now_frame.dlc = msg->data_length_code;
-    memcpy(esp_now_frame.data, msg->data, msg->data_length_code);
-    err = esp_now_send(broadcast_addr, (uint8_t*)&esp_now_frame,
-                       sizeof(esp_now_frame));
+    const int max_retries = 3;
+    int retry_count = 0;
+
+    esp_now_packet_t packet;
+    do {
+        packet.mesh_id = esp_now_mesh_id;
+        packet.can_id = msg->message.identifier;
+        packet.dlc = msg->message.data_length_code;
+        packet.timestamp = msg->timestamp;
+        memcpy(packet.data, msg->message.data, msg->message.data_length_code);
+
+        err = esp_now_send(broadcast_addr, (uint8_t*)&packet, sizeof(packet));
+
+        if (err == ESP_ERR_ESPNOW_NO_MEM) {
+            retry_count++;
+            vTaskDelay(pdMS_TO_TICKS(2 * retry_count));  // Increasing backoff
+            debugf("ESP-NOW memory error, retry %d of %d\n", retry_count,
+                   max_retries);
+        }
+    } while (err == ESP_ERR_ESPNOW_NO_MEM && retry_count < max_retries);
+
     if (err != ESP_OK) {
-        debugln("Failed to broadcast CAN msg");
+        debugf("Failed to send CAN msg after %d attempts: %d\n", retry_count,
+               err);
+    } else {
+        debugln("ESPNOW SEND SUCCESS");
     }
+
+    return err;
 }
 
 // status variables
 static bool error_flag = false;
 static bool msg_received_flag = false;
-
-// twai variables
-twai_message_t message;
-twai_status_info_t twai_status;
 
 // functions
 bool can_setup(void);
@@ -130,7 +191,7 @@ void can_task(void* parameters);
 
 // task delays
 #define ESP_NOW_TASK_DELAY 500
-#define CAN_TASK_DELAY     5
+#define CAN_TASK_DELAY     10
 
 // START SETUP
 
@@ -138,6 +199,7 @@ void setup() {
 #ifdef DEBUG
     Serial.begin(115200);
 #endif
+    data_mutex = xSemaphoreCreateMutex();
 
     pinMode(GPIO_ERROR_LED, OUTPUT);
     digitalWrite(GPIO_ERROR_LED, HIGH);
@@ -173,7 +235,10 @@ void setup() {
     // END TIMER
 
     xTaskCreatePinnedToCore(can_task, "CAN Task", 4096, NULL, 1, NULL, 0);
-    xTaskCreatePinnedToCore(esp_now_task, "ESP NOW Task", 4096, NULL, 2, NULL, 1);
+    xTaskCreatePinnedToCore(esp_now_task, "ESP NOW Task", 4096, NULL, 2, NULL,
+                            1);
+
+    debugln("System started");
 
     delay(500);
     digitalWrite(GPIO_ERROR_LED, LOW);
@@ -190,8 +255,29 @@ void esp_now_task(void* parameters) {
     TickType_t last_wake_time = xTaskGetTickCount();
 
     for (;;) {
-        debugln("ESPNOW SEND....OK");
-        esp_now_send_can_msg(&message);
+        if (xSemaphoreTake(data_mutex, pdMS_TO_TICKS(50)) == pdTRUE) {
+            for (int i = 0; i < active_can_ids_count; i++) {
+                if (can_data_store[i].updated) {
+                    can_data_store[i].updated = false;
+
+                    xSemaphoreGive(data_mutex);
+
+                    esp_err_t result = esp_now_send_can_msg(&can_data_store[i]);
+                    vTaskDelay(2);
+
+                    if (xSemaphoreTake(data_mutex, pdMS_TO_TICKS(50)) !=
+                        pdTRUE) {
+                        debugln("Failed to re-obtain mutex in esp_now_task");
+                        break;
+                    }
+                }
+            }
+            xSemaphoreGive(data_mutex);
+        } else {
+            debugln("Failed to obtain mutex in esp_now_task");
+            break;
+        }
+
         xTaskDelayUntil(&last_wake_time, pdMS_TO_TICKS(ESP_NOW_TASK_DELAY));
     }
 }
@@ -223,8 +309,8 @@ void can_task(void* parameters) {
 
 bool can_setup() {
     // Initialize configuration structures using macro initializers
-    twai_general_config_t g_config =
-        TWAI_GENERAL_CONFIG_DEFAULT(GPIO_CAN_TX, GPIO_CAN_RX, TWAI_MODE_LISTEN_ONLY);
+    twai_general_config_t g_config = TWAI_GENERAL_CONFIG_DEFAULT(
+        GPIO_CAN_TX, GPIO_CAN_RX, TWAI_MODE_LISTEN_ONLY);
     twai_timing_config_t t_config = TWAI_TIMING_CONFIG_1MBITS();
     twai_filter_config_t f_config = TWAI_FILTER_CONFIG_ACCEPT_ALL();
 
@@ -251,17 +337,20 @@ bool can_setup() {
         TWAI_ALERT_RX_QUEUE_FULL | TWAI_ALERT_RX_FIFO_OVERRUN;
 
     if (twai_reconfigure_alerts(alerts_to_enable, NULL) == ESP_OK) {
-        printf("Alerts reconfigured\n");
+        debugln("Alerts reconfigured\n");
     } else {
-        printf("Failed to reconfigure alerts");
+        debugln("Failed to reconfigure alerts");
         return false;
     }
     return true;
 }
 
 void can_check_alerts() {
+    twai_message_t rx_message;
+
     uint32_t alerts_triggered;
     twai_read_alerts(&alerts_triggered, pdMS_TO_TICKS(POLLING_RATE_MS));
+
     if (alerts_triggered != 0) {
         // enabled alerts:
         // - TWAI_ALERT_RX_DATA
@@ -273,13 +362,26 @@ void can_check_alerts() {
         // - TWAI_ALERT_RX_FIFO_OVERRUN
         if ((alerts_triggered & TWAI_ALERT_RX_DATA) != 0) {
             debugln("CAN RECV.......OK");
-            while (twai_receive(&message, 0) == ESP_OK) {
-                debugf("MSG............%03X  [%d]  ", message.identifier,
-                       message.data_length_code);
-                for (int i = 0; i < message.data_length_code; i++) {
-                    debugf("%02X ", message.data[i]);
-                }
+            while (twai_receive(&rx_message, 0) == ESP_OK) {
+                debugf("MSG............%03X  [%d]  ", rx_message.identifier,
+                       rx_message.data_length_code);
                 debugln();
+
+                uint32_t can_id = rx_message.identifier;
+                uint64_t current_time = esp_timer_get_time();
+
+                if (xSemaphoreTake(data_mutex, pdMS_TO_TICKS(10)) == pdTRUE) {
+                    int slot = find_can_id_slot(can_id);
+                    if (slot >= 0) {
+                        memcpy(&can_data_store[slot].message, &rx_message,
+                               sizeof(twai_message_t));
+                        can_data_store[slot].updated = true;
+                        can_data_store[slot].timestamp = current_time;
+                    }
+                    xSemaphoreGive(data_mutex);
+                } else {
+                    debugln("Failed to obtain mutex in can_task");
+                }
             }
             msg_received_flag = true;
         }
