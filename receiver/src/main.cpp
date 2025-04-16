@@ -1,105 +1,127 @@
-#define DEBUG
-
-#ifdef DEBUG
-#define debug(x)       Serial.print(x)
-#define debugln(x)     Serial.println(x)
-#define debugf(fmt, x) Serial.printf(fmt, x)
-#else
-#define debug(x)
-#define debugln(x)
-#define debugf(fmt, x)
-#endif
-
 #include <Arduino.h>
 #include <WiFi.h>
+#include <esp_log.h>
 #include <esp_now.h>
 
-#include <unordered_map>
+static const char *TAG = "dioCAN_receiver";
 
-#define EMPTY_MAP_TIME 30
+// ESP-NOW definitions
 
-uint32_t last_empty_timestamp = 0;
+#define MESH_ID 18460
 
-// SavvyCAN serial variables
+typedef struct esp_now_packet_s {
+    uint64_t timestamp;
+    uint8_t data[8];
+    int mesh_id;
+    uint32_t can_id;
+    uint8_t dlc;
+} esp_now_packet_t;
+
+// packet circular buffer
+#define PACKET_QUEUE_SIZE 10
+
+esp_now_packet_t packet_queue[PACKET_QUEUE_SIZE];
+volatile int queue_head = 0;
+volatile int queue_tail = 0;
+volatile int queue_count = 0;
+
+bool queue_push(const esp_now_packet_t *packet);
+bool queue_pop(esp_now_packet_t *packet);
+
+// ESP-NOW recv callback
+void recv_cb(const uint8_t *mac, const uint8_t *data, int len);
+
+// SavvyCAN serial variables and definitions
 
 #define SERIAL_MAX_BUFF_LEN 30
 char slcan_com[SERIAL_MAX_BUFF_LEN];
 bool send_ok = true;
 bool send_can_msgs = true;
 bool send_timestamp = true;
-
-// ESP-NOW definitions
-
-#define MESH_ID 18460
-
-typedef struct esp_now_frame_s {
-    int mesh_id;
-    uint32_t can_id;
-    uint8_t dlc;
-    uint8_t data[8];
-} esp_now_frame_t;
-
-// ESP-NOW recv callback
-void recv_cb(const uint8_t *mac, const uint8_t *data, int len);
+bool new_packet_received = false;
 
 // SavvyCAN functions
-void send_can_over_serial(const esp_now_frame_t *ef);
+void send_can_over_serial(const esp_now_packet_t *ef);
 void handle_serial(void);
 void send_ack(void);
 void send_nack(void);
-unsigned short slcan_get_time(void);
-
-// map that checks which msg has been recvd
-static std::unordered_map<uint32_t, bool> map_recv;
-// map that holds the most recent can_messages
-static std::unordered_map<uint32_t, esp_now_frame_t> map_msgs;
+uint32_t slcan_get_time(const esp_now_packet_t *packet);
 
 void setup() {
     Serial.begin(115200);
 
+    esp_log_level_set(TAG, ESP_LOG_INFO);
+
     WiFi.mode(WIFI_STA);
     while (esp_now_init() != ESP_OK) {
-        debugln("Error initializing ESP-NOW");
+        ESP_LOGE(TAG, "Failed to init ESP_NOW");
         return;
     }
     esp_now_register_recv_cb(recv_cb);
+
+    ESP_LOGI(TAG, "STARTED");
 
     delay(500);
 }
 
 void loop() {
-    uint32_t current_millis = millis();
+    esp_now_packet_t current_packet;
 
-    if (map_msgs.empty()) {
-        return;
-    }
-
-    for (const auto &recv_pair : map_recv) {
-        if (recv_pair.second) {
-            esp_now_frame_t ef = map_msgs[recv_pair.first];
-            send_can_over_serial(&ef);
-            handle_serial();
+    if (send_can_msgs && queue_count > 0) {
+        if (queue_pop(&current_packet)) {
+            send_can_over_serial(&current_packet);
         }
-        map_recv[recv_pair.first] = false;
     }
 
-    if (current_millis - last_empty_timestamp > EMPTY_MAP_TIME * 1000) {
-        map_recv.clear();
-        map_msgs.clear();
-        last_empty_timestamp = current_millis;
-    }
+    handle_serial();
+
+    delay(5);
 }
 
 // esp_now recv callback
 void recv_cb(const uint8_t *mac, const uint8_t *data, int len) {
-    esp_now_frame_t esp_now_frame;
-    memcpy(&esp_now_frame, data, sizeof(esp_now_frame));
-    map_msgs[esp_now_frame.can_id] = esp_now_frame;
-    map_recv[esp_now_frame.can_id] = true;
+    esp_now_packet_t received_packet;
+    memcpy(&received_packet, data, sizeof(esp_now_packet_t));
+
+    // Add to queue
+    if (!queue_push(&received_packet)) {
+        ESP_LOGW(TAG, "Queue full, packet dropped!");
+    } else {
+        ESP_LOGI(TAG, "Queued packet with ID: 0x%x, DLC: %d, queue size: %d\n",
+                 received_packet.can_id, received_packet.dlc, queue_count);
+    }
 }
 
-// SavvyCAN functions
-void send_can_over_serial(const esp_now_frame_t *ef) {
+// queue functions
+bool queue_push(const esp_now_packet_t *packet) {
+    if (queue_count >= PACKET_QUEUE_SIZE) {
+        ESP_LOGW(TAG, "Queue is full, packet lost.");
+        return false;
+    }
+
+    memcpy(&packet_queue[queue_head], packet, sizeof(esp_now_packet_t));
+
+    queue_head = (queue_head + 1) % PACKET_QUEUE_SIZE;
+    queue_count++;
+
+    return true;
+}
+
+bool queue_pop(esp_now_packet_t *packet) {
+    if (queue_count <= 0) {
+        ESP_LOGW(TAG, "Trying to pop from empty queue.");
+        return false;
+    }
+
+    memcpy(packet, &packet_queue[queue_tail], sizeof(esp_now_packet_t));
+
+    queue_tail = (queue_tail + 1) % PACKET_QUEUE_SIZE;
+    queue_count--;
+
+    return true;
+}
+
+void send_can_over_serial(const esp_now_packet_t *packet) {
     // total_buf_size:
     // + can_id(9)
     // + dlc(1)
@@ -111,24 +133,25 @@ void send_can_over_serial(const esp_now_frame_t *ef) {
     char buf[36];
     int idx = 0;
 
-    if (ef->can_id <= 0x7FF) {
+    if (packet->can_id <= 0x7FF) {
         // Standard 11-bit CAN ID
-        idx += snprintf(buf + idx, sizeof(buf) - idx, "t%03x", ef->can_id);
-    } else if (ef->can_id <= 0x1FFFFFFF) {
+        idx += snprintf(buf + idx, sizeof(buf) - idx, "t%03x", packet->can_id);
+    } else if (packet->can_id <= 0x1FFFFFFF) {
         // Extended 29-bit CAN ID
-        idx += snprintf(buf + idx, sizeof(buf) - idx, "T%08x", ef->can_id);
+        idx += snprintf(buf + idx, sizeof(buf) - idx, "T%08x", packet->can_id);
     } else {
         // Invalid CAN ID
         return;
     }
 
-    idx += snprintf(buf + idx, sizeof(buf) - idx, "%d", ef->dlc);
-    for (int i = 0; i < ef->dlc; i++) {
-        idx += snprintf(buf + idx, sizeof(buf) - idx, "%02x", ef->data[i]);
+    idx += snprintf(buf + idx, sizeof(buf) - idx, "%d", packet->dlc);
+    for (int i = 0; i < packet->dlc; i++) {
+        idx += snprintf(buf + idx, sizeof(buf) - idx, "%02x", packet->data[i]);
     }
 
     if (send_timestamp) {
-        idx += snprintf(buf + idx, sizeof(buf) - idx, "%02x", slcan_get_time());
+        idx += snprintf(buf + idx, sizeof(buf) - idx, "%02x",
+                        slcan_get_time(packet));
     }
 
     buf[idx++] = '\r';  // Carriage return
@@ -255,9 +278,7 @@ void send_nack() {
     Serial.write('\a');  // NACK
 }
 
-unsigned short slcan_get_time() {
-    unsigned long current_time = millis();
-    unsigned short timestamp =
-        static_cast<unsigned short>(current_time % 60000);
-    return timestamp;
+uint32_t slcan_get_time(const esp_now_packet_t *packet) {
+    uint32_t timestamp_ms = (uint32_t)(packet->timestamp / 1000);
+    return timestamp_ms & 0xFFFF;
 }
