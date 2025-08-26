@@ -3,6 +3,8 @@
 #include <esp_log.h>
 #include <esp_now.h>
 
+#include "driver/twai.h"
+
 static const char *TAG = "dioCAN_receiver";
 
 // ESP-NOW definitions
@@ -11,14 +13,21 @@ static const char *TAG = "dioCAN_receiver";
 
 typedef struct esp_now_packet_s {
     uint64_t timestamp;
-    uint8_t data[8];
-    int mesh_id;
+    uint8_t data[TWAI_FRAME_MAX_DLC];
     uint32_t can_id;
+    int mesh_id;
     uint8_t dlc;
 } esp_now_packet_t;
 
+#define MAX_BATCH_SIZE 5
+
+typedef struct {
+    esp_now_packet_t msgs[MAX_BATCH_SIZE];
+    uint8_t count;
+} esp_now_batch_t;
+
 // packet circular buffer
-#define PACKET_QUEUE_SIZE 10
+#define PACKET_QUEUE_SIZE MAX_BATCH_SIZE
 
 esp_now_packet_t packet_queue[PACKET_QUEUE_SIZE];
 volatile int queue_head = 0;
@@ -80,15 +89,15 @@ void loop() {
 
 // esp_now recv callback
 void recv_cb(const uint8_t *mac, const uint8_t *data, int len) {
-    esp_now_packet_t received_packet;
-    memcpy(&received_packet, data, sizeof(esp_now_packet_t));
+    const esp_now_batch_t *batch = (const esp_now_batch_t *)data;
 
-    // Add to queue
-    if (!queue_push(&received_packet)) {
-        ESP_LOGW(TAG, "Queue full, packet dropped!");
-    } else {
-        ESP_LOGI(TAG, "Queued packet with ID: 0x%x, DLC: %d, queue size: %d\n",
-                 received_packet.can_id, received_packet.dlc, queue_count);
+    for (int i = 0; i < batch->count; i++) {
+        const esp_now_packet_t &it = batch->msgs[i];
+        if (!queue_push(&it)) {
+            ESP_LOGW(TAG, "Queue full, packet dropped!");
+        } else {
+            ESP_LOGI(TAG, "Queued packet with ID: 0x%x, DLC: %d, queue size: %d\n", it.can_id, it.dlc, queue_count);
+        }
     }
 }
 
@@ -150,8 +159,7 @@ void send_can_over_serial(const esp_now_packet_t *packet) {
     }
 
     if (send_timestamp) {
-        idx += snprintf(buf + idx, sizeof(buf) - idx, "%02x",
-                        slcan_get_time(packet));
+        idx += snprintf(buf + idx, sizeof(buf) - idx, "%02x", slcan_get_time(packet));
     }
 
     buf[idx++] = '\r';  // Carriage return
